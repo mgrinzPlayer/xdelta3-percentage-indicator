@@ -47,6 +47,13 @@
  * again with a more general error message.
  */
 
+/*
+ *
+ * Added percentage indicator
+ * mgr.inz.Player
+ *
+ */
+
 /*********************************************************************/
 
 #ifndef XD3_POSIX
@@ -81,6 +88,10 @@ xsnprintf_func (char *str, int n, const char *fmt, ...)
     }
   return ret;
 }
+
+void getProcessedBytes(xoff_t *percentageindicator_pos);
+void setProcessedBytes(xoff_t *percentageindicator_pos);
+char *replace_str2 (const char *str, const char *old, const char *new);
 
 /* If none are set, default to posix. */
 #if (XD3_POSIX + XD3_STDIO + XD3_WIN32) == 0
@@ -233,6 +244,12 @@ XD3_MAKELIST(main_merge_list,main_merge,link);
 
 /* Program options: various command line flags and options. */
 static int         option_stdout             = 0;
+static usize_t     option_percentageindicator= 0;
+static xoff_t      percentageindicator_pos   = 0;
+static xoff_t      percentageindicator_max   = 0;
+static xoff_t      percentage_currentFileSize= 0;
+static const char* percentageindicator_msg_pr= NULL;
+static const char* percentageindicator_msg_ti= NULL;
 static int         option_force              = 0;
 static int         option_verbose            = DEFAULT_VERBOSE;
 static int         option_quiet              = 0;
@@ -358,7 +375,8 @@ static int
 main_version (void)
 {
   /* $Format: "  XPR(NTR \"Xdelta version $Xdelta3Version$, Copyright (C) 2007, 2008, 2009, 2010, 2011, 2012, 2013, Joshua MacDonald\\n\");" $ */
-  XPR(NTR "Xdelta version 3.0.8, Copyright (C) 2007, 2008, 2009, 2010, 2011, 2012, 2013 Joshua MacDonald\n");
+  XPR(NTR "Xdelta version 3.0.8, Copyright (C) 2007-2014 Joshua MacDonald\n");
+  XPR(NTR "modifications: percentage indicator by mgr.inz.Player 2014\n");
   XPR(NTR "Xdelta comes with ABSOLUTELY NO WARRANTY.\n");
   XPR(NTR "This is free software, and you are welcome to redistribute it\n");
   XPR(NTR "under certain conditions; see \"COPYING\" for details.\n");
@@ -407,6 +425,12 @@ static void
 reset_defaults(void)
 {
   option_stdout = 0;
+  option_percentageindicator= 0;
+  percentageindicator_pos   = 0;
+  percentageindicator_max   = 0;
+  percentage_currentFileSize= 0;
+  percentageindicator_msg_pr= "Progress: #f";
+  percentageindicator_msg_ti= "Progress: #f [#a of all]";
   option_force = 0;
   option_verbose = DEFAULT_VERBOSE;
   option_quiet = 0;
@@ -2681,7 +2705,7 @@ main_apphead_string (const char* x)
 }
 
 static int
-main_set_appheader (xd3_stream *stream, main_file *input, main_file *sfile)
+main_set_appheader (xd3_stream *stream, main_file *input, main_file *sfile, xoff_t currentFileSize)
 {
   /* The user may disable the application header.  Once the appheader
    * is set, this disables setting it again. */
@@ -2703,7 +2727,9 @@ main_set_appheader (xd3_stream *stream, main_file *input, main_file *sfile)
 
       iname = main_apphead_string (input->filename);
       icomp = (input->compressor == NULL) ? "" : input->compressor->ident;
-      len = (usize_t) strlen (iname) + (usize_t) strlen (icomp) + 2;
+      len = (usize_t) strlen (iname) + (usize_t) strlen (icomp) + 2
+                                                                + sizeof(xoff_t)  // currentFileSize (type xoff_t)
+                                                                + 3;              // magicbytes
 
       if (sfile->filename != NULL)
 	{
@@ -2730,6 +2756,17 @@ main_set_appheader (xd3_stream *stream, main_file *input, main_file *sfile)
 	  snprintf_func ((char*)appheader_used, len, "%s/%s/%s/%s",
 		    iname, icomp, sname, scomp);
 	}
+
+    // magic bytes
+    *((char*)( appheader_used + len - sizeof(xoff_t) - 3 )) = 1;
+    *((char*)( appheader_used + len - sizeof(xoff_t) - 2 )) = 2;
+    *((char*)( appheader_used + len - sizeof(xoff_t) - 1 )) = 0;
+
+    // currentFileSize
+    *((xoff_t *)( appheader_used + len - sizeof(xoff_t) )) = currentFileSize;
+    xd3_set_appheader (stream, appheader_used,len);
+
+    return 0;
     }
 
   xd3_set_appheader (stream, appheader_used,
@@ -2815,6 +2852,9 @@ main_get_appheader (xd3_stream *stream, main_file *ifile,
       char *slash;
       int   place = 0;
       char *parsed[kMaxArgs];
+
+      if (   appheadsz>=(sizeof(xoff_t)+3) && strcmp(start + appheadsz - sizeof(xoff_t) - 3,"\x01\x02")==0   )
+        percentage_currentFileSize = *((xoff_t*)(apphead + appheadsz - sizeof(xoff_t)));
 
       memset (parsed, 0, sizeof (parsed));
 
@@ -3167,6 +3207,16 @@ main_input (xd3_cmd     cmd,
   /* This times each window. */
   get_millisecs_since ();
 
+  char PIbuffer [7680];
+  int alreadyTriedReadProcessedBytes=0;
+  xoff_t inputFileSize=0; // this is newFile size when encoding
+                          // and diff file size when decoding
+  main_file_stat(ifile, &inputFileSize);
+
+  char clearline[7680];
+  memset(clearline, 32, 7680);
+  int clearlineLen=0;
+
   /* Main input loop. */
   do
     {
@@ -3197,7 +3247,7 @@ main_input (xd3_cmd     cmd,
        * all the information needed to encode the application
        * header. */
       if (cmd == CMD_ENCODE &&
-	  (ret = main_set_appheader (& stream, ifile, sfile)))
+	  (ret = main_set_appheader (& stream, ifile, sfile, inputFileSize)))
 	{
 	  return EXIT_FAILURE;
 	}
@@ -3309,6 +3359,59 @@ main_input (xd3_cmd     cmd,
 			    stream.i_slots_used, stream.iopt_size);
 		      }
 		  }
+
+        if (cmd == CMD_DECODE &&
+        option_percentageindicator &&
+        (percentage_currentFileSize || inputFileSize) )
+          {
+            char *buff;
+            double curr, overall;
+
+            if (!alreadyTriedReadProcessedBytes) {
+              alreadyTriedReadProcessedBytes=1;
+              getProcessedBytes(&percentageindicator_pos);
+            }
+
+            if (percentage_currentFileSize==0) curr = 100.0 * stream.total_in  / inputFileSize;
+            else                               curr = 100.0 * stream.total_out / percentage_currentFileSize;
+
+            if (percentageindicator_max==0) overall = curr;
+            else                            overall = 100.0 * (stream.total_out + percentageindicator_pos)
+                                                            / percentageindicator_max;
+
+
+            if (option_percentageindicator==1 || option_percentageindicator==3)
+             {
+                buff = replace_str2(percentageindicator_msg_pr,"#f","%6.2f%%%%"); // current file
+                snprintf_func (PIbuffer, 7680, buff, curr);
+                main_free(buff);
+                buff = replace_str2(PIbuffer,"#a","%6.2f%%");      // overall
+                snprintf_func (PIbuffer, 7680, buff, overall);
+                main_free(buff);
+                //print
+                *(clearline+clearlineLen)=0;
+                XPR("\r%s\r%s",clearline,PIbuffer);
+                *(clearline+clearlineLen)=32;
+                clearlineLen=strlen(PIbuffer);
+             }
+
+             if (option_percentageindicator==2 || option_percentageindicator==3)
+             {
+                buff = replace_str2(percentageindicator_msg_ti,"#f","%6.2f%%%%"); // current file
+                snprintf_func (PIbuffer, 7680, buff, curr);
+                main_free(buff);
+                buff = replace_str2(PIbuffer,"#a","%6.2f%%");      // overall
+                snprintf_func (PIbuffer, 7680, buff, overall);
+                main_free(buff);
+                //title
+                #if XD3_WIN32
+                  SetConsoleTitle(PIbuffer);
+                #else
+                  printf("%c]0;%s%c", '\033', PIbuffer, '\007');
+                #endif
+             }
+
+          }
 
 		if (option_verbose)
 		  {
@@ -3447,15 +3550,25 @@ done:
 
   xd3_free_stream (& stream);
 
+  xoff_t nwrite = ofile != NULL ? ofile->nwrite : 0;
   if (option_verbose)
     {
       shortbuf tm;
       long end_time = get_millisecs_now ();
-      xoff_t nwrite = ofile != NULL ? ofile->nwrite : 0;
 
       XPR(NT "finished in %s; input %"Q"u output %"Q"u bytes (%0.2f%%)\n",
 	  main_format_millis (end_time - start_time, &tm),
 	  ifile->nread, nwrite, 100.0 * nwrite / ifile->nread);
+    }
+
+  if (cmd == CMD_DECODE && option_percentageindicator)
+    {
+      xoff_t totalWrite = nwrite + percentageindicator_pos;
+      *(clearline+clearlineLen)=0;
+      XPR("\r%s\r",clearline);
+      if (percentageindicator_max) {
+        setProcessedBytes(&totalWrite);
+      }
     }
 
   return EXIT_SUCCESS;
@@ -3558,7 +3671,7 @@ int main (int argc, char **argv)
 #endif
 {
   static const char *flags =
-    "0123456789cdefhnqvDFJNORTVs:m:B:C:E:I:L:O:M:P:W:A::S::";
+    "0123456789cdefhnqvDFJNORTVs:m:B:C:E:I:L:O:M:P:W:A::S::p:a:";
   xd3_cmd cmd;
   main_file ifile;
   main_file ofile;
@@ -3597,6 +3710,12 @@ int main (int argc, char **argv)
   argv = env_argv;
   argc = env_argc;
   program_name = env_argv[0];
+
+  char *XDELTA3_TITLE = getenv("XDELTA3_TITLE");
+  if ( XDELTA3_TITLE!=NULL ) percentageindicator_msg_ti=XDELTA3_TITLE;
+
+  char *XDELTA3_PRINT = getenv("XDELTA3_PRINT");
+  if ( XDELTA3_PRINT!=NULL ) percentageindicator_msg_pr=XDELTA3_PRINT;
 
  takearg:
   my_optarg = NULL;
@@ -3798,6 +3917,20 @@ int main (int argc, char **argv)
 	      goto exit;
 	    }
 	  break;
+    case 'p': // use percentage indicator
+      if ((ret = main_atou (my_optarg, & option_percentageindicator, 0,
+                3, 'p')))
+        {
+          goto exit;
+        }
+      break;
+    case 'a': // overall file size
+      if ((ret = main_atoux (my_optarg, & percentageindicator_max, 0,
+                0, 'a')))
+        {
+          goto exit;
+        }
+      break;
 	case 'W':
 	  if ((ret = main_atou (my_optarg, & option_winsize, XD3_ALLOCSIZE,
 				XD3_HARDMAXWINSIZE, 'W')))
@@ -4045,5 +4178,100 @@ main_help (void)
   XPR(NTR "   XDELTA=\"-s source-x.y.tar.gz\" \\\n");
   XPR(NTR "   tar --use-compress-program=xdelta3 \\\n");
   XPR(NTR "       -cf target-x.z.tar.gz.vcdiff target-x.y\n");
+
+  XPR(NTR "\n\nNew options\n");
+  XPR(NTR "percentage indicator options:\n");
+  XPR(NTR "   -p type      enable percentage indicator when decoding,\n");
+  XPR(NTR "                types: 0=none, 1=stdout, 2=console title, 3=both\n");
+  XPR(NTR "   -a size      known overall size, sum of all decoded files\n");
+  XPR(NTR "                will use ~xdelta3.tmp file, be sure to delete it\n");
+  XPR(NTR "                before and after patching all the files\n\n");
+
+  XPR(NTR "the XDELTA3_TITLE environment variable may contain custom title\n");
+  XPR(NTR "by default, console title is \"Progress: #f [#a of all]\"\n");
+
+  XPR(NTR "the XDELTA3_PRINT environment variable may contain output format\n");
+  XPR(NTR "by default, output format is \"Progress: #f\"\n");
+
+
+  XPR(NTR "e.g. set XDELTA3_TITLE=Patching: #f [#a of all]\n");
+  XPR(NTR "e.g. set XDELTA3_TITLE=Patching: #f\n");
+  XPR(NTR "e.g. set XDELTA3_TITLE=Progress: #a\n");
+  XPR(NTR "e.g. set XDELTA3_PRINT=Progress: #a\n");
+  XPR(NTR "e.g. set XDELTA3_PRINT=Progress: #a current file:#f\n");
+
+  XPR(NTR "\n\nBuild by mgr.inz.Player\n\n\n");
   return EXIT_FAILURE;
+}
+
+
+void
+getProcessedBytes(xoff_t *pos)
+{
+  main_file processedBytesFile;
+  main_file_init(&processedBytesFile);
+  processedBytesFile.filename = "~xdelta3.tmp";
+
+  if (main_file_exists(&processedBytesFile))
+  {
+    main_file_open(&processedBytesFile, "~xdelta3.tmp", XO_READ);
+    size_t nread;
+    main_file_read(&processedBytesFile, (uint8_t *) pos,
+                   (usize_t)sizeof(xoff_t), &nread, "Read tmp file for percentageindicator");
+    main_file_close(&processedBytesFile);
+  }
+}
+
+void
+setProcessedBytes(xoff_t *pos)
+{
+  main_file processedBytesFile;
+  main_file_init(&processedBytesFile);
+  processedBytesFile.filename = "~xdelta3.tmp";
+
+  int PrevOption_force = option_force;
+  option_force=1;
+  main_file_open(&processedBytesFile, "~xdelta3.tmp", XO_WRITE);
+  option_force=PrevOption_force;
+
+  main_file_write(&processedBytesFile, (uint8_t *) pos,
+                  (usize_t)sizeof(xoff_t), "Write tmp file for percentageindicator");
+  main_file_close(&processedBytesFile);
+}
+
+char *
+replace_str2 (const char *str, const char *old, const char *new)
+{
+    char *ret, *r;
+    const char *p, *q;
+    size_t oldlen = strlen(old);
+    size_t count, retlen, newlen = strlen(new);
+    int samesize = (oldlen == newlen);
+
+    if (!samesize) {
+        for (count = 0, p = str; (q = strstr(p, old)) != NULL; p = q + oldlen)
+            count++;
+        retlen = p - str + strlen(p) + count * (newlen - oldlen);
+    } else
+        retlen = strlen(str);
+
+    if ((ret = main_malloc(retlen + 1)) == NULL)
+        return NULL;
+
+    r = ret, p = str;
+    while (1) {
+        if (!samesize && !count--)
+            break;
+        if ((q = strstr(p, old)) == NULL)
+            break;
+        ptrdiff_t l = q - p;
+        memcpy(r, p, l);
+        r += l;
+        memcpy(r, new, newlen);
+        r += newlen;
+        p = q + oldlen;
+    }
+    strcpy(r, p);
+
+    return ret;
 }

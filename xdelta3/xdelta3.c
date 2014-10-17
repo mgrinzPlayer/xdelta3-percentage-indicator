@@ -4707,7 +4707,11 @@ xd3_source_extend_match (xd3_stream *stream)
 
       if ((ret = xd3_getblk (stream, tryblk)))
 	{
-	  XD3_ASSERT (ret != XD3_TOOFARBACK);
+	  /* if search went too far back, continue forward. */
+	  if (ret == XD3_TOOFARBACK)
+	    {
+	      break;
+	    }
 
 	  /* could be a XD3_GETSRCBLK failure. */
 	  return ret;
