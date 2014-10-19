@@ -271,6 +271,7 @@ static usize_t     option_winsize            = XD3_DEFAULT_WINSIZE;
  * addresses in the large hash checksum are 32 bits.  The flag is read
  * as xoff_t, so that 4Gb != 0. */
 static xoff_t      option_srcwinsz           = XD3_DEFAULT_SRCWINSZ;
+static int         option_srcwinsz_setByUser = 0;
 static usize_t     option_sprevsz            = XD3_DEFAULT_SPREVSZ;
 
 /* These variables are supressed to avoid their use w/o support.  main() warns
@@ -2944,9 +2945,38 @@ main_open_output (xd3_stream *stream, main_file *ofile)
 	  return EEXIST;
 	}
 
+#ifdef XD3_WIN32
+int option_quietOld = option_quiet; option_quiet=1;
+#endif
       if ((ret = main_file_open (ofile, ofile->filename, XO_WRITE)))
 	{
-	  return ret;
+#ifdef XD3_WIN32
+      option_quiet = option_quietOld;
+
+      char *pp,*p=strdup(ofile->filename); // copy path
+
+      while ((pp=strchr(p,'/'))!=NULL) *pp='\\'; // replace all slash to backslash
+
+      if ((pp=strrchr(p,'\\'))!=NULL) { // contains dir path ?
+
+        char buf[7680];
+
+        *pp=0; // cut at last backslash
+
+        while (strlen(p) && *( p+strlen(p)-1 )=='\\')
+                            *( p+strlen(p)-1 )=0; // remove backslashes at the end
+
+        while (strlen(p) && *( p+strlen(p)-1 )=='"')
+                            *( p+strlen(p)-1 )=0; // remove " at the end
+
+        while (*p=='"') p++;                      // remove " at the beginning
+
+        snprintf_func(buf,7680,"MD \"%s\" >NUL 2>NUL",p);
+        system(buf);
+		ret = main_file_open (ofile, ofile->filename, XO_WRITE);
+      }
+#endif
+      if (ret) return ret;
 	}
 
       if (option_verbose > 1) { XPR(NT "output %s\n", ofile->filename); }
@@ -3901,6 +3931,7 @@ int main (int argc, char **argv)
 	      goto exit;
 	    }
 	  option_srcwinsz = bsize;
+	  option_srcwinsz_setByUser = 1;
 	  break;
 	}
 	case 'I':
