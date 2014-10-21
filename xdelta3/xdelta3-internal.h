@@ -105,10 +105,17 @@ struct _main_file
  * absence of the '_' prefix) but they were initially buggy.  So,
  * always use the native '_'-prefixed version with Win32. */
 #ifdef _WIN32
+
+/*
 #define vsnprintf_func(str,size,fmt,args) \
   _vsnprintf_s(str,size,size-1,fmt,args)
 #define snprintf_func(str,size,fmt,...) \
   _snprintf_s(str,size,size-1,fmt,__VA_ARGS__)
+
+*///  use *nprintf instead of *nprintf_s
+#define vsnprintf_func _vsnprintf
+#define snprintf_func _snprintf
+
 #else
 #define vsnprintf_func vsnprintf
 #define snprintf_func snprintf
