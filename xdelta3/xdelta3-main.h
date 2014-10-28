@@ -69,6 +69,81 @@
 #define NOT_MAIN 0
 #endif
 
+
+/* Taskbar - for now Windows 7 and above */
+#if XD3_WIN32
+#include <ShObjIdl.h>
+
+// needed for MinGW-w64 3.1.0
+const GUID IID_ITaskbarList3  = { 0xea1afb91,0x9e28,0x4b86,{0x90,0xe9,0x9e,0x9f,0x8a,0x5e,0xef,0xaf}};
+
+ITaskbarList3* Taskbar_pITbL3 = NULL;
+#endif
+
+HWND  Taskbar_Window          = NULL;
+int   Taskbar_Fail            = 0;
+
+int
+Taskbar_Init()
+{
+  if (Taskbar_Fail) return 0;
+
+#if XD3_WIN32
+  if (Taskbar_pITbL3) return 1;
+
+  Taskbar_Window = GetConsoleWindow();
+
+  CoInitialize(NULL);
+  CoCreateInstance(&CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
+                   &IID_ITaskbarList3, (void **)&Taskbar_pITbL3);
+  if (Taskbar_pITbL3) return 1;
+  CoUninitialize();
+#else
+#endif
+
+  Taskbar_Fail = 1;
+  return 0;
+}
+
+
+void
+Taskbar_SetProgressValue(xoff_t Completed, xoff_t Total)
+{
+#if XD3_WIN32
+  if (Taskbar_Init())
+    Taskbar_pITbL3->lpVtbl->SetProgressValue(Taskbar_pITbL3, Taskbar_Window, Completed, Total);
+#else
+#endif
+}
+
+void
+Taskbar_SetProgressState(TBPFLAG flag)
+{
+#if XD3_WIN32
+  if (Taskbar_Init())
+    Taskbar_pITbL3->lpVtbl->SetProgressState(Taskbar_pITbL3, Taskbar_Window, flag);
+#else
+#endif
+}
+
+void
+Taskbar_Done()
+{
+#if XD3_WIN32
+  if (Taskbar_Window) Taskbar_SetProgressState(TBPF_NOPROGRESS);
+  if (Taskbar_pITbL3) {Taskbar_pITbL3->lpVtbl->Release(Taskbar_pITbL3); CoUninitialize();}
+  Taskbar_Fail = 1;
+#else
+#endif
+}
+
+void Taskbar_Normal() {Taskbar_SetProgressState(TBPF_NORMAL);}
+void Taskbar_Error() {Taskbar_SetProgressState(TBPF_ERROR);}
+void Taskbar_Indeterminate() {Taskbar_SetProgressState(TBPF_INDETERMINATE);}
+
+
+
+
 /* Combines xd3_strerror() and strerror() */
 const char* xd3_mainerror(int err_num);
 
@@ -89,8 +164,8 @@ xsnprintf_func (char *str, int n, const char *fmt, ...)
   return ret;
 }
 
-void getProcessedBytes(xoff_t *percentageindicator_pos);
-void setProcessedBytes(xoff_t *percentageindicator_pos);
+void loadPercentageIndicatorStatus();
+void savePercentageIndicatorStatus();
 char *replace_str2 (const char *str, const char *old, const char *new);
 
 /* If none are set, default to posix. */
@@ -250,6 +325,7 @@ static xoff_t      percentageindicator_max   = 0;
 static xoff_t      percentage_currentFileSize= 0;
 static const char* percentageindicator_msg_pr= NULL;
 static const char* percentageindicator_msg_ti= NULL;
+static usize_t  percentageindicator_errstatus= 0; // 1 means there was an error
 static int         option_force              = 0;
 static int         option_verbose            = DEFAULT_VERBOSE;
 static int         option_quiet              = 0;
@@ -432,6 +508,7 @@ reset_defaults(void)
   percentage_currentFileSize= 0;
   percentageindicator_msg_pr= "Progress: #f";
   percentageindicator_msg_ti= "Progress: #f [#a of all]";
+  percentageindicator_errstatus= 0; // 1 means there was an error
   option_force = 0;
   option_verbose = DEFAULT_VERBOSE;
   option_quiet = 0;
@@ -2758,6 +2835,9 @@ main_set_appheader (xd3_stream *stream, main_file *input, main_file *sfile, xoff
 		    iname, icomp, sname, scomp);
 	}
 
+    // to be sure there is null termination (it should be, but sometimes it's not, depends on **nprintf version)
+    *((char*)( appheader_used + len - sizeof(xoff_t) - 4 )) = 0;
+
     // magic bytes
     *((char*)( appheader_used + len - sizeof(xoff_t) - 3 )) = 1;
     *((char*)( appheader_used + len - sizeof(xoff_t) - 2 )) = 2;
@@ -3238,7 +3318,6 @@ main_input (xd3_cmd     cmd,
   get_millisecs_since ();
 
   char PIbuffer [7680];
-  int alreadyTriedReadProcessedBytes=0;
   xoff_t inputFileSize=0; // this is newFile size when encoding
                           // and diff file size when decoding
   main_file_stat(ifile, &inputFileSize);
@@ -3316,6 +3395,8 @@ main_input (xd3_cmd     cmd,
 		  {
 		    return EXIT_FAILURE;
 		  }
+        if (percentageindicator_errstatus==0) Taskbar_Normal(); else Taskbar_Error();
+        Taskbar_SetProgressValue(percentageindicator_pos,percentageindicator_max);
 	      }
 	  }
 	/* FALLTHROUGH */
@@ -3390,48 +3471,45 @@ main_input (xd3_cmd     cmd,
 		      }
 		  }
 
-        if (cmd == CMD_DECODE &&
-        option_percentageindicator &&
-        (percentage_currentFileSize || inputFileSize) )
+        if (cmd == CMD_DECODE && (percentage_currentFileSize || inputFileSize) )
           {
             char *buff;
-            double curr, overall;
+            xoff_t curr, overall;
 
-            if (!alreadyTriedReadProcessedBytes) {
-              alreadyTriedReadProcessedBytes=1;
-              getProcessedBytes(&percentageindicator_pos);
-            }
-
-            if (percentage_currentFileSize==0) curr = 100.0 * stream.total_in  / inputFileSize;
-            else                               curr = 100.0 * stream.total_out / percentage_currentFileSize;
+            if (percentage_currentFileSize==0) curr = 100000 * stream.total_in  / inputFileSize;
+            else                               curr = 100000 * stream.total_out / percentage_currentFileSize;
 
             if (percentageindicator_max==0) overall = curr;
-            else                            overall = 100.0 * (stream.total_out + percentageindicator_pos)
-                                                            / percentageindicator_max;
+            else                            overall = 100000 * (stream.total_out + percentageindicator_pos)
+                                                             / percentageindicator_max;
 
+            Taskbar_SetProgressValue(overall,100000);
 
             if (option_percentageindicator==1 || option_percentageindicator==3)
              {
                 buff = replace_str2(percentageindicator_msg_pr,"#f","%6.2f%%%%"); // current file
-                snprintf_func (PIbuffer, 7680, buff, curr);
+                snprintf_func (PIbuffer, 7680, buff, curr/1000.);
                 main_free(buff);
                 buff = replace_str2(PIbuffer,"#a","%6.2f%%");      // overall
-                snprintf_func (PIbuffer, 7680, buff, overall);
+                snprintf_func (PIbuffer, 7680, buff, overall/1000.);
                 main_free(buff);
                 //print
                 *(clearline+clearlineLen)=0;
-                XPR("\r%s\r%s",clearline,PIbuffer);
+                if (clearlineLen>strlen(PIbuffer)) XPR("\r%s\r%s",clearline,PIbuffer);
+                else                               XPR("\r%s",PIbuffer);
                 *(clearline+clearlineLen)=32;
                 clearlineLen=strlen(PIbuffer);
+
+                if (option_verbose) XPR("  ");
              }
 
              if (option_percentageindicator==2 || option_percentageindicator==3)
              {
                 buff = replace_str2(percentageindicator_msg_ti,"#f","%6.2f%%%%"); // current file
-                snprintf_func (PIbuffer, 7680, buff, curr);
+                snprintf_func (PIbuffer, 7680, buff, curr/1000.);
                 main_free(buff);
                 buff = replace_str2(PIbuffer,"#a","%6.2f%%");      // overall
-                snprintf_func (PIbuffer, 7680, buff, overall);
+                snprintf_func (PIbuffer, 7680, buff, overall/1000.);
                 main_free(buff);
                 //title
                 #if XD3_WIN32
@@ -3593,12 +3671,10 @@ done:
 
   if (cmd == CMD_DECODE && option_percentageindicator)
     {
-      xoff_t totalWrite = nwrite + percentageindicator_pos;
       *(clearline+clearlineLen)=0;
       XPR("\r%s\r",clearline);
-      if (percentageindicator_max) {
-        setProcessedBytes(&totalWrite);
-      }
+
+      if (percentageindicator_max) percentageindicator_pos+=nwrite;
     }
 
   return EXIT_SUCCESS;
@@ -4074,6 +4150,12 @@ int main (int argc, char **argv)
     }
 #endif /* VCDIFF_TOOLS */
 
+  if (cmd == CMD_DECODE)
+    {
+      if (option_percentageindicator && percentageindicator_max) loadPercentageIndicatorStatus();
+      Taskbar_Indeterminate(); // normal behaviour (wait for allocations, etc)
+    }
+
   switch (cmd)
     {
     case CMD_PRINTHDR:
@@ -4111,6 +4193,19 @@ int main (int argc, char **argv)
     exit:
       (void)0;
     }
+
+  if (cmd == CMD_DECODE) {
+    // any errors ? (and previous error)
+    percentageindicator_errstatus=percentageindicator_errstatus || ((ret==EXIT_FAILURE) ? 1 : 0);
+
+    if (option_percentageindicator && percentageindicator_max) savePercentageIndicatorStatus();
+
+    //prcnInd_max and prcnInd_pos are both zero when there's no -a switch, so condition is always true.
+    //If there's -a switch, condition will be true only on last file and only when no errors
+    //(if there is at least one error, condition will be false)
+    if ((percentageindicator_max==percentageindicator_pos) && percentageindicator_errstatus==0)
+      Taskbar_Done();
+  }
 
 #if EXTERNAL_COMPRESSION
   main_external_compression_cleanup ();
@@ -4235,39 +4330,45 @@ main_help (void)
   return EXIT_FAILURE;
 }
 
+xoff_t xdelta3tmp[2] = {0,0};
 
 void
-getProcessedBytes(xoff_t *pos)
+loadPercentageIndicatorStatus()
 {
-  main_file processedBytesFile;
-  main_file_init(&processedBytesFile);
-  processedBytesFile.filename = "~xdelta3.tmp";
+  main_file percentIndStatusFile;
+  main_file_init(&percentIndStatusFile);
+  percentIndStatusFile.filename = "~xdelta3.tmp";
 
-  if (main_file_exists(&processedBytesFile))
+  if (main_file_exists(&percentIndStatusFile))
   {
-    main_file_open(&processedBytesFile, "~xdelta3.tmp", XO_READ);
+    main_file_open(&percentIndStatusFile, percentIndStatusFile.filename, XO_READ);
     size_t nread;
-    main_file_read(&processedBytesFile, (uint8_t *) pos,
-                   (usize_t)sizeof(xoff_t), &nread, "Read tmp file for percentageindicator");
-    main_file_close(&processedBytesFile);
+    main_file_read(&percentIndStatusFile, (uint8_t *) xdelta3tmp,
+                   (usize_t)sizeof(xoff_t)*2, &nread, "Read tmp file for percentageindicator");
+    main_file_close(&percentIndStatusFile);
+
+  percentageindicator_pos       = xdelta3tmp[0];
+  percentageindicator_errstatus = xdelta3tmp[1];
   }
 }
 
 void
-setProcessedBytes(xoff_t *pos)
+savePercentageIndicatorStatus()
 {
-  main_file processedBytesFile;
-  main_file_init(&processedBytesFile);
-  processedBytesFile.filename = "~xdelta3.tmp";
+  xdelta3tmp[0]=percentageindicator_pos;
+  xdelta3tmp[1]=percentageindicator_errstatus;
+  main_file percentIndStatusFile;
+  main_file_init(&percentIndStatusFile);
+  percentIndStatusFile.filename = "~xdelta3.tmp";
 
   int PrevOption_force = option_force;
   option_force=1;
-  main_file_open(&processedBytesFile, "~xdelta3.tmp", XO_WRITE);
+  main_file_open(&percentIndStatusFile, percentIndStatusFile.filename, XO_WRITE);
   option_force=PrevOption_force;
 
-  main_file_write(&processedBytesFile, (uint8_t *) pos,
-                  (usize_t)sizeof(xoff_t), "Write tmp file for percentageindicator");
-  main_file_close(&processedBytesFile);
+  main_file_write(&percentIndStatusFile, (uint8_t *) xdelta3tmp,
+                  (usize_t)sizeof(xoff_t)*2, "Write tmp file for percentageindicator");
+  main_file_close(&percentIndStatusFile);
 }
 
 char *
