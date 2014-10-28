@@ -80,6 +80,16 @@ const GUID IID_ITaskbarList3  = { 0xea1afb91,0x9e28,0x4b86,{0x90,0xe9,0x9e,0x9f,
 ITaskbarList3* Taskbar_pITbL3 = NULL;
 #endif
 
+#ifndef __ITaskbarList3_INTERFACE_DEFINED__
+typedef enum TBPFLAG {
+    TBPF_NOPROGRESS = 0x0,
+    TBPF_INDETERMINATE = 0x1,
+    TBPF_NORMAL = 0x2,
+    TBPF_ERROR = 0x4,
+    TBPF_PAUSED = 0x8
+} TBPFLAG;
+#endif
+
 HWND  Taskbar_Window          = NULL;
 int   Taskbar_Fail            = 0;
 
