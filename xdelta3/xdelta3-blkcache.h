@@ -134,7 +134,7 @@ main_set_source (xd3_stream *stream, xd3_cmd cmd,
   //adaptive srcwinsz:
   //the entire contents of the source file will be loaded into memory when source_size<=1GB
   if (source_size && option_srcwinsz_setByUser==0)
-    option_srcwinsz = max(min(xd3_pow2_roundup (source_size),1U << 30),XD3_MINSRCWINSZ);
+    option_srcwinsz = max(min(xd3_xoff_roundup (source_size),1U << 30),XD3_MINSRCWINSZ);
 
   /* Though called "lru", it is not LRU-specific.  We always allocate
    * a maximum number of source block buffers.  If the entire file
